@@ -1,1042 +1,1259 @@
-import pygame
+#!/usr/bin/env python3
+"""
+Path Tracer Pro — DearPyGui Edition
+FTC autonomous path planning tool.
+"""
+
+import dearpygui.dearpygui as dpg
 import json
 import math
 import os
-from pygame.locals import *
+import copy
+import subprocess
 from typing import List, Tuple, Optional
 
-# Field configuration
+from environment import Environment, EnvironmentEditor
+
+# ── Field configuration ─────────────────────────────────────────────
 FIELD_WIDTH_IN = 144
 FIELD_HEIGHT_IN = 144
-BACKGROUND_IMAGE = "field.png"
+BACKGROUND_IMAGE = "nope"
 OUTPUT_FILE = "path.json"
 FUNCTIONS_FILE = "functions.json"
+PREFS_FILE = "preferences.json"
 
-# Initial window settings
-DEFAULT_SCALE = 6
-MIN_SCALE = 2
+# ── View defaults ────────────────────────────────────────────────────
+DEFAULT_SCALE = 5
+MIN_SCALE = 1
 MAX_SCALE = 15
 INITIAL_WINDOW_W = 1280
 INITIAL_WINDOW_H = 960
+MENU_BAR_HEIGHT = 22
 
-# Path settings
+# ── Path settings ────────────────────────────────────────────────────
 STEP_SIZE = 0.5
-GRID_INCHES = 24
 SNAP_ANGLES = [math.radians(a) for a in [0, 45, 90, 135, 180, 225, 270, 315]]
 
-# Colors
-COLOR_BG = (30, 30, 30)
-COLOR_GRID = (50, 50, 50)
-COLOR_PATH = (255, 0, 0)
-COLOR_FUNCTION = (0, 255, 0)
-COLOR_UI_BG = (40, 40, 40, 200)
-COLOR_UI_TEXT = (255, 255, 255)
-COLOR_UI_HIGHLIGHT = (70, 70, 70)
-COLOR_MENU_BG = (50, 50, 50, 230)
-COLOR_MENU_BORDER = (100, 100, 100)
+# ── Colors (RGBA 0-255) ─────────────────────────────────────────────
+COL_BG = (30, 30, 30, 255)
+COL_GRID = (50, 50, 50, 255)
+COL_PATH = (255, 0, 0, 255)
+COL_PATH_POINT = (255, 80, 80, 255)
+COL_FUNC_WAIT = (0, 255, 0, 255)
+COL_FUNC_MOVE = (0, 150, 255, 255)
+COL_FUNC_ROT = (255, 255, 0, 255)
+COL_START = (255, 255, 255, 255)
+COL_START_INNER = (0, 255, 0, 255)
+COL_HINT = (100, 255, 100, 255)
 
+MAX_UNDO = 100
+
+
+# ── Data classes ─────────────────────────────────────────────────────
 class Function:
-    def __init__(self, name: str, x: float, y: float, rotation: float = 0, 
+    def __init__(self, name: str, x: float, y: float, rotation: float = 0,
                  function_type: str = "wait_till", action: str = "function"):
         self.name = name
         self.x = x
         self.y = y
         self.rotation = rotation
-        self.function_type = function_type  # "wait_till" or "run_while_moving"
-        self.action = action  # "function" or "rotate_only"
+        self.function_type = function_type
+        self.action = action
         self.width = 12
         self.height = 12
-    
+
     def to_dict(self):
         return {
-            "name": self.name,
-            "x": self.x,
-            "y": self.y,
-            "rotation": self.rotation,
-            "type": self.function_type,
-            "action": self.action
+            "name": self.name, "x": self.x, "y": self.y,
+            "rotation": self.rotation, "type": self.function_type,
+            "action": self.action,
         }
-    
+
+    def clone(self):
+        return Function(self.name, self.x, self.y, self.rotation,
+                        self.function_type, self.action)
+
     @staticmethod
     def from_dict(data):
         return Function(
-            data["name"], 
-            data["x"], 
-            data["y"], 
+            data["name"], data["x"], data["y"],
             data.get("rotation", 0),
             data.get("type", "wait_till"),
-            data.get("action", "function")
+            data.get("action", "function"),
         )
 
+
+# ── Main application ────────────────────────────────────────────────
 class PathTracer:
     def __init__(self):
-        pygame.init()
-        self.screen = pygame.display.set_mode((INITIAL_WINDOW_W, INITIAL_WINDOW_H), RESIZABLE)
-        pygame.display.set_caption("Path Tracer Pro")
-        
-        self.clock = pygame.time.Clock()
-        self.font = pygame.font.SysFont("consolas", 16)
-        self.font_large = pygame.font.SysFont("consolas", 24)
-        self.font_small = pygame.font.SysFont("consolas", 14)
-        
         # View state
         self.scale = DEFAULT_SCALE
-        self.offset_x = 0
-        self.offset_y = 0
-        self.fullscreen = False
-        self.fullscreen_padding = 0
-        
+        self.offset_x = 0.0
+        self.offset_y = 0.0
+
         # Path state
         self.drawing = False
-        self.last_point = None
-        self.path_points = []
-        
+        self.last_point: Optional[Tuple[float, float]] = None
+        self.path_points: List[Tuple[float, float]] = []
+
         # Start position
-        self.start_pos = None  # (x, y, rotation)
+        self.start_pos: Optional[Tuple[float, float, float]] = None
         self.placing_start = False
-        
+
         # Function state
-        self.functions = []
+        self.functions: List[Function] = []
         self.function_templates = ["intake", "outtake", "score", "park"]
-        self.selected_function = None
-        self.selected_function_type = "wait_till"  # or "run_while_moving"
-        self.selected_action = "function"  # or "rotate_only"
+        self.selected_function: Optional[str] = None
+        self.selected_function_type = "wait_till"
+        self.selected_action = "function"
         self.placing_function = False
-        self.dragging_function = None
-        
+
         # Snap settings
         self.snap_enabled = False
         self.snap_inches = 24
         self.grid_offset = 0
-        self.grid_offset_mode = False
-        
-        # UI state
-        self.show_help = False
-        self.show_settings = False
-        self.show_function_menu = False
-        self.context_menu_pos = None
-        self.context_menu_items = []
-        
+
         # Panning
         self.panning = False
-        self.pan_start = None
-        self.pan_offset_start = None
-        
-        # Load background
-        self.load_background()
-        self.load_functions()
-        
-    def load_background(self):
-        if os.path.exists(BACKGROUND_IMAGE):
-            self.bg_original = pygame.image.load(BACKGROUND_IMAGE).convert()
-            self.update_background_scale()
-        else:
-            self.bg = None
-            self.bg_original = None
-    
-    def update_background_scale(self):
-        if self.bg_original:
-            w = int(FIELD_WIDTH_IN * self.scale)
-            h = int(FIELD_HEIGHT_IN * self.scale)
-            self.bg = pygame.transform.scale(self.bg_original, (w, h))
-        else:
-            self.bg = None
-    
-    def load_functions(self):
-        if os.path.exists(FUNCTIONS_FILE):
-            try:
-                with open(FUNCTIONS_FILE, "r") as f:
-                    data = json.load(f)
-                    self.functions = [Function.from_dict(f) for f in data.get("functions", [])]
-                    self.function_templates = data.get("templates", self.function_templates)
-                    
-                    # Load start position
-                    if "start_pos" in data:
-                        sp = data["start_pos"]
-                        self.start_pos = (sp["x"], sp["y"], sp["rotation"])
-                    
-                print(f"Loaded {len(self.functions)} functions")
-                if self.start_pos:
-                    print(f"Loaded start position at ({self.start_pos[0]:.1f}, {self.start_pos[1]:.1f}) facing {self.start_pos[2]}°")
-            except Exception as e:
-                print(f"Error loading functions: {e}")
-    
-    def save_functions(self):
-        data = {
-            "functions": [f.to_dict() for f in self.functions],
-            "templates": self.function_templates
+        self.pan_start: Optional[Tuple[float, float]] = None
+        self.pan_offset_start: Optional[Tuple[float, float]] = None
+
+        # Background texture
+        self.bg_texture_id = None
+
+        # Status
+        self.status_msg = "Ready — Press H for help"
+
+        # View toggles
+        self.show_grid = True
+        self.show_path_points = True
+        self.show_labels = True
+        self.show_status_bar = True
+
+        # Undo / Redo
+        self.undo_stack: list = []
+        self.redo_stack: list = []
+        self._suppress_snapshot = False
+
+        # Clipboard
+        self.clipboard: Optional[dict] = None
+
+        # Preferences
+        self.prefs = {
+            "step_size": STEP_SIZE,
+            "default_scale": DEFAULT_SCALE,
+            "snap_inches": 24,
+            "grid_offset": 0,
+            "path_thickness": 3,
+            "point_radius": 4,
+            "path_color": list(COL_PATH),
+            "auto_save": False,
         }
-        
-        # Save start position
-        if self.start_pos:
-            data["start_pos"] = {
-                "x": self.start_pos[0],
-                "y": self.start_pos[1],
-                "rotation": self.start_pos[2]
-            }
-        
-        with open(FUNCTIONS_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-        print(f"Saved {len(self.functions)} functions")
-        if self.start_pos:
-            print(f"Saved start position")
-    
-    def toggle_fullscreen(self):
-        self.fullscreen = not self.fullscreen
-        if self.fullscreen:
-            info = pygame.display.Info()
-            self.screen = pygame.display.set_mode((info.current_w, info.current_h), FULLSCREEN)
-            
-            # Calculate padding to center the field
-            field_w = FIELD_WIDTH_IN * self.scale
-            field_h = FIELD_HEIGHT_IN * self.scale
-            self.fullscreen_padding = min(
-                (info.current_w - field_w) // 2,
-                (info.current_h - field_h) // 2
-            )
+        self._load_prefs()
+
+        # Current open files
+        self.current_path_file: Optional[str] = None
+        self.current_functions_file: Optional[str] = None
+
+        # Environment
+        self.env_editor = EnvironmentEditor(
+            on_save_callback=self._on_env_saved,
+            on_close_callback=self._on_env_closed,
+        )
+        self.active_env: Optional[Environment] = None
+
+    # ─────────────────────────────────────────────────────────────
+    # Undo / Redo
+    # ─────────────────────────────────────────────────────────────
+    def _snapshot(self) -> dict:
+        return {
+            "path_points": list(self.path_points),
+            "functions": [f.to_dict() for f in self.functions],
+            "start_pos": self.start_pos,
+            "function_templates": list(self.function_templates),
+        }
+
+    def _restore(self, snap: dict):
+        self._suppress_snapshot = True
+        self.path_points = list(snap["path_points"])
+        self.functions = [Function.from_dict(d) for d in snap["functions"]]
+        self.start_pos = snap["start_pos"]
+        self.function_templates = list(snap["function_templates"])
+        self._suppress_snapshot = False
+
+    def push_undo(self):
+        if self._suppress_snapshot:
+            return
+        self.undo_stack.append(self._snapshot())
+        if len(self.undo_stack) > MAX_UNDO:
+            self.undo_stack.pop(0)
+        self.redo_stack.clear()
+
+    def undo(self):
+        if not self.undo_stack:
+            self.status_msg = "Nothing to undo"
+            return
+        self.redo_stack.append(self._snapshot())
+        self._restore(self.undo_stack.pop())
+        self.status_msg = "Undo"
+
+    def redo(self):
+        if not self.redo_stack:
+            self.status_msg = "Nothing to redo"
+            return
+        self.undo_stack.append(self._snapshot())
+        self._restore(self.redo_stack.pop())
+        self.status_msg = "Redo"
+
+    # ─────────────────────────────────────────────────────────────
+    # Clipboard
+    # ─────────────────────────────────────────────────────────────
+    def copy_selection(self):
+        if hasattr(self, "_ctx_func") and self._ctx_func in self.functions:
+            self.clipboard = {"type": "function", "data": self._ctx_func.to_dict()}
+            self.status_msg = f"Copied function '{self._ctx_func.name}'"
+        elif self.path_points:
+            self.clipboard = {"type": "path", "data": list(self.path_points)}
+            self.status_msg = f"Copied path ({len(self.path_points)} pts)"
         else:
-            self.screen = pygame.display.set_mode((INITIAL_WINDOW_W, INITIAL_WINDOW_H), RESIZABLE)
-            self.fullscreen_padding = 0
-        
-        self.update_background_scale()
-    
-    def screen_to_field(self, sx: int, sy: int) -> Tuple[float, float]:
-        """Convert screen coordinates to field coordinates (in inches)"""
-        fx = (sx - self.offset_x - self.fullscreen_padding) / self.scale
-        fy = (sy - self.offset_y - self.fullscreen_padding) / self.scale
-        return fx, fy
-    
-    def field_to_screen(self, fx: float, fy: float) -> Tuple[int, int]:
-        """Convert field coordinates to screen coordinates"""
-        sx = int(fx * self.scale + self.offset_x + self.fullscreen_padding)
-        sy = int(fy * self.scale + self.offset_y + self.fullscreen_padding)
-        return sx, sy
-    
-    def snap_coord(self, x: float, y: float) -> Tuple[float, float]:
+            self.status_msg = "Nothing to copy"
+
+    def cut_selection(self):
+        if hasattr(self, "_ctx_func") and self._ctx_func in self.functions:
+            self.push_undo()
+            self.clipboard = {"type": "function", "data": self._ctx_func.to_dict()}
+            self.functions.remove(self._ctx_func)
+            self.status_msg = f"Cut function '{self._ctx_func.name}'"
+        elif self.path_points:
+            self.push_undo()
+            self.clipboard = {"type": "path", "data": list(self.path_points)}
+            self.path_points.clear()
+            self.status_msg = "Cut path"
+        else:
+            self.status_msg = "Nothing to cut"
+
+    def paste_clipboard(self):
+        if not self.clipboard:
+            self.status_msg = "Clipboard empty"
+            return
+        self.push_undo()
+        if self.clipboard["type"] == "function":
+            f = Function.from_dict(self.clipboard["data"])
+            f.x += 6
+            f.y += 6
+            self.functions.append(f)
+            self.status_msg = f"Pasted function '{f.name}'"
+        elif self.clipboard["type"] == "path":
+            self.path_points = list(self.clipboard["data"])
+            self.status_msg = f"Pasted path ({len(self.path_points)} pts)"
+
+    # ─────────────────────────────────────────────────────────────
+    # Preferences
+    # ─────────────────────────────────────────────────────────────
+    def _load_prefs(self):
+        if os.path.exists(PREFS_FILE):
+            try:
+                with open(PREFS_FILE, "r") as f:
+                    self.prefs.update(json.load(f))
+            except Exception:
+                pass
+        self._apply_prefs()
+
+    def _apply_prefs(self):
+        global STEP_SIZE
+        STEP_SIZE = self.prefs["step_size"]
+        self.snap_inches = self.prefs["snap_inches"]
+        self.grid_offset = self.prefs["grid_offset"]
+
+    def _save_prefs(self):
+        with open(PREFS_FILE, "w") as f:
+            json.dump(self.prefs, f, indent=2)
+        self._apply_prefs()
+        self.status_msg = "Preferences saved"
+
+    # ── Coordinate conversion ────────────────────────────────────
+    def screen_to_field(self, sx, sy):
+        return (sx - self.offset_x) / self.scale, (sy - self.offset_y) / self.scale
+
+    def field_to_screen(self, fx, fy):
+        return fx * self.scale + self.offset_x, fy * self.scale + self.offset_y
+
+    def snap_coord(self, x, y):
         if not self.snap_enabled:
             return x, y
-        
-        x_adj = x - self.grid_offset
-        y_adj = y - self.grid_offset
-        
-        sx = round(x_adj / self.snap_inches) * self.snap_inches + self.grid_offset
-        sy = round(y_adj / self.snap_inches) * self.snap_inches + self.grid_offset
-        
-        return sx, sy
-    
-    def zoom(self, delta: int, mouse_pos: Optional[Tuple[int, int]] = None):
-        old_scale = self.scale
-        self.scale = max(MIN_SCALE, min(MAX_SCALE, self.scale + delta))
-        
-        if mouse_pos and old_scale != self.scale:
-            # Zoom towards mouse position
-            mx, my = mouse_pos
-            fx, fy = self.screen_to_field(mx, my)
-            
-            self.update_background_scale()
-            
-            new_sx, new_sy = self.field_to_screen(fx, fy)
-            self.offset_x += mx - new_sx
-            self.offset_y += my - new_sy
-        else:
-            self.update_background_scale()
-    
-    def draw_grid(self):
-        spacing_px = int(GRID_INCHES * self.scale)
-        offset_px = int(self.grid_offset * self.scale)
-        
-        start_x = self.fullscreen_padding + self.offset_x
-        start_y = self.fullscreen_padding + self.offset_y
-        
-        field_w = int(FIELD_WIDTH_IN * self.scale)
-        field_h = int(FIELD_HEIGHT_IN * self.scale)
-        
-        # Vertical lines
-        x = start_x + (offset_px % spacing_px)
-        while x <= start_x + field_w:
-            pygame.draw.line(self.screen, COLOR_GRID, (x, start_y), (x, start_y + field_h), 1)
-            x += spacing_px
-        
-        # Horizontal lines
-        y = start_y + (offset_px % spacing_px)
-        while y <= start_y + field_h:
-            pygame.draw.line(self.screen, COLOR_GRID, (start_x, y), (start_x + field_w, y), 1)
-            y += spacing_px
-    
-    def draw_path(self):
-        if len(self.path_points) < 2:
-            return
-        
-        for i in range(len(self.path_points) - 1):
-            x1, y1 = self.path_points[i]
-            x2, y2 = self.path_points[i + 1]
-            
-            sx1, sy1 = self.field_to_screen(x1, y1)
-            sx2, sy2 = self.field_to_screen(x2, y2)
-            
-            pygame.draw.line(self.screen, COLOR_PATH, (sx1, sy1), (sx2, sy2), 3)
-        
-        # Draw points
-        for x, y in self.path_points:
-            sx, sy = self.field_to_screen(x, y)
-            pygame.draw.circle(self.screen, COLOR_PATH, (sx, sy), 4)
-    
-    def draw_start_pos(self):
-        """Draw the start position with a special marker"""
-        if not self.start_pos:
-            return
-        
-        x, y, rotation = self.start_pos
-        sx, sy = self.field_to_screen(x, y)
-        
-        # Draw a large circle for start position
-        radius = int(18 * self.scale)
-        
-        # Draw outer circle (white)
-        pygame.draw.circle(self.screen, (255, 255, 255), (sx, sy), radius, 3)
-        
-        # Draw inner circle (green)
-        pygame.draw.circle(self.screen, (0, 255, 0), (sx, sy), radius - 5, 2)
-        
-        # Draw direction arrow
-        angle = math.radians(rotation)
-        arrow_length = radius + 10
-        end_x = sx + math.cos(angle) * arrow_length
-        end_y = sy + math.sin(angle) * arrow_length
-        
-        # Main arrow line
-        pygame.draw.line(self.screen, (255, 255, 255), (sx, sy), (end_x, end_y), 4)
-        
-        # Arrow head
-        arrow_size = 10
-        left_angle = angle + math.radians(150)
-        right_angle = angle - math.radians(150)
-        
-        left_x = end_x + math.cos(left_angle) * arrow_size
-        left_y = end_y + math.sin(left_angle) * arrow_size
-        right_x = end_x + math.cos(right_angle) * arrow_size
-        right_y = end_y + math.sin(right_angle) * arrow_size
-        
-        pygame.draw.polygon(self.screen, (255, 255, 255), [
-            (end_x, end_y),
-            (left_x, left_y),
-            (right_x, right_y)
-        ])
-        
-        # Draw "START" label
-        label = self.font.render("START", True, (255, 255, 255))
-        self.screen.blit(label, (sx - label.get_width()//2, sy - radius - 25))
-        
-        # Draw rotation angle
-        angle_label = self.font_small.render(f"{rotation}°", True, (200, 200, 200))
-        self.screen.blit(angle_label, (sx - angle_label.get_width()//2, sy + radius + 5))
-    
-    def draw_functions(self):
-        for func in self.functions:
-            sx, sy = self.field_to_screen(func.x, func.y)
-            w = int(func.width * self.scale)
-            h = int(func.height * self.scale)
-            
-            # Check if mouse is near this function during drawing (for visual feedback)
-            mouse_near = False
-            if self.drawing:
-                mx, my = pygame.mouse.get_pos()
-                fx, fy = self.screen_to_field(mx, my)
-                dx = abs(fx - func.x)
-                dy = abs(fy - func.y)
-                if dx < func.width / 2 and dy < func.height / 2:
-                    mouse_near = True
-            
-            # Choose color based on function type
-            if func.action == "rotate_only":
-                color = (255, 255, 0)  # Yellow for rotation only
-            elif func.function_type == "wait_till":
-                color = COLOR_FUNCTION  # Green
-            else:  # run_while_moving
-                color = (0, 150, 255)  # Blue
-            
-            # Brighten color if mouse is near during drawing
-            if mouse_near:
-                color = tuple(min(255, c + 50) for c in color)
-                # Draw highlight circle
-                pygame.draw.circle(self.screen, color, (sx, sy), int(w * 0.8), 2)
-            
-            # Draw rectangle (filled if wait_till, outline if run_while_moving)
-            rect = pygame.Rect(sx - w//2, sy - h//2, w, h)
-            if func.action == "rotate_only":
-                pygame.draw.circle(self.screen, color, (sx, sy), w//2, 2)
-            elif func.function_type == "wait_till":
-                pygame.draw.rect(self.screen, color, rect, 2)
-            else:
-                pygame.draw.rect(self.screen, color, rect, 2)
-                # Add diagonal lines to indicate "while moving"
-                pygame.draw.line(self.screen, color, 
-                               (sx - w//2, sy - h//2), 
-                               (sx + w//2, sy + h//2), 1)
-            
-            # Draw rotation indicator
-            angle = math.radians(func.rotation)
-            end_x = sx + math.cos(angle) * w // 2
-            end_y = sy + math.sin(angle) * h // 2
-            pygame.draw.line(self.screen, color, (sx, sy), (end_x, end_y), 2)
-            
-            # Draw label with type indicator
-            type_prefix = "R:" if func.action == "rotate_only" else ("W:" if func.function_type == "wait_till" else "M:")
-            label_text = f"{type_prefix}{func.name}" if func.action != "rotate_only" else f"R:{func.rotation}°"
-            label = self.font_small.render(label_text, True, color)
-            self.screen.blit(label, (sx - label.get_width()//2, sy - h//2 - 20))
-            
-            # Show "SNAP!" text when mouse is near during drawing
-            if mouse_near:
-                snap_text = self.font_small.render("SNAP!", True, (255, 255, 255))
-                self.screen.blit(snap_text, (sx - snap_text.get_width()//2, sy + h//2 + 5))
-    
-    def draw_ui(self):
-        # Top bar
-        info_lines = [
-            f"Zoom: {self.scale}x | Pan: ({self.offset_x}, {self.offset_y})",
-            f"Snap: {'ON' if self.snap_enabled else 'OFF'} | Grid: {self.snap_inches}in | Offset: {self.grid_offset}in",
-            f"Points: {len(self.path_points)} | Functions: {len(self.functions)}",
-        ]
-        
-        # Add start position status
-        if self.start_pos:
-            x, y, rot = self.start_pos
-            info_lines.append(f"Start: ({x:.1f}, {y:.1f}) @ {rot}°")
-        else:
-            info_lines.append("⚠ START POSITION NOT SET - Press P to place")
-        
-        info_lines.append("Press H for Help")
-        
-        y = 10
-        for i, line in enumerate(info_lines):
-            # Highlight warning in red
-            if "⚠" in line:
-                color = (255, 100, 100)
-            else:
-                color = COLOR_UI_TEXT
-                
-            surf = self.font_small.render(line, True, color)
-            bg_rect = pygame.Rect(5, y-2, surf.get_width()+10, surf.get_height()+4)
-            s = pygame.Surface((bg_rect.width, bg_rect.height), pygame.SRCALPHA)
-            s.fill(COLOR_UI_BG)
-            self.screen.blit(s, bg_rect)
-            self.screen.blit(surf, (10, y))
-            y += surf.get_height() + 5
-    
-    def draw_help_menu(self):
-        help_text = [
-            "=== PATH TRACER PRO - HELP ===",
-            "",
-            "IMPORTANT: Place START position first (Press P)",
-            "",
-            "MOUSE CONTROLS:",
-            "  Left Click + Drag: Draw path",
-            "  Right Click: Context menu",
-            "  Middle Click + Drag: Pan view",
-            "  Scroll Wheel: Zoom in/out",
-            "",
-            "KEYBOARD SHORTCUTS:",
-            "  H: Toggle this help menu",
-            "  P: Place/Replace start position",
-            "  S: Save path and functions",
-            "  L: Load path and functions",
-            "  C: Clear current path",
-            "  G: Toggle grid snapping",
-            "  F: Open function placement menu",
-            "  Ctrl+F / F11: Toggle fullscreen",
-            "  +/-: Adjust snap size (or grid offset in offset mode)",
-            "  `: Toggle grid offset mode",
-            "  ESC: Exit",
-            "",
-            "START POSITION:",
-            "  Press P to place the start position",
-            "  The arrow shows the robot's starting direction",
-            "  Right-click on start to adjust rotation",
-            "  You MUST place start before drawing paths",
-            "  Path automatically starts from START position",
-            "",
-            "PATH DRAWING:",
-            "  First click automatically connects to START",
-            "  Click near a function to snap path to it",
-            "  Path will highlight functions when near them",
-            "  Great for ensuring path goes through functions",
-            "",
-            "FUNCTIONS:",
-            "  Press F to open function menu",
-            "  R: Rotate Only - just rotates robot to angle",
-            "  F: Function - runs a function at this point",
-            "    W: Wait Till Complete - stops and waits",
-            "    M: Run While Moving - runs during movement",
-            "  Select function type and click to place",
-            "  Right-click on function to edit/delete",
-            "",
-            "FUNCTION COLORS:",
-            "  White Circle + Arrow: Start Position",
-            "  Yellow Circle: Rotate Only",
-            "  Green Square: Wait Till Complete",
-            "  Blue Square: Run While Moving",
-            "",
-            "Press H or ESC to close"
-        ]
-        
-        # Calculate menu size
-        max_width = max(self.font.render(line, True, COLOR_UI_TEXT).get_width() for line in help_text)
-        line_height = self.font.get_height()
-        menu_width = max_width + 40
-        menu_height = len(help_text) * (line_height + 2) + 40
-        
-        screen_w, screen_h = self.screen.get_size()
-        menu_x = (screen_w - menu_width) // 2
-        menu_y = (screen_h - menu_height) // 2
-        
-        # Draw background
-        s = pygame.Surface((menu_width, menu_height), pygame.SRCALPHA)
-        s.fill(COLOR_MENU_BG)
-        self.screen.blit(s, (menu_x, menu_y))
-        
-        # Draw border
-        pygame.draw.rect(self.screen, COLOR_MENU_BORDER, (menu_x, menu_y, menu_width, menu_height), 2)
-        
-        # Draw text
-        y = menu_y + 20
-        for line in help_text:
-            if line.startswith("==="):
-                surf = self.font_large.render(line, True, COLOR_UI_TEXT)
-            else:
-                surf = self.font.render(line, True, COLOR_UI_TEXT)
-            self.screen.blit(surf, (menu_x + 20, y))
-            y += line_height + 2
-    
-    def draw_function_menu(self):
-        menu_text = ["=== FUNCTION PLACEMENT ===", ""]
-        menu_text.append("ACTION TYPE:")
-        menu_text.append("R. Rotate Only (just rotate robot)")
-        menu_text.append("F. Function (run a function)")
-        menu_text.append("")
-        
-        if self.selected_action == "function":
-            menu_text.append("FUNCTION TYPE:")
-            menu_text.append("W. Wait Till Complete")
-            menu_text.append("M. Run While Moving")
-            menu_text.append("")
-            menu_text.append("FUNCTIONS:")
-            menu_text.extend([f"{i+1}. {name}" for i, name in enumerate(self.function_templates)])
-            menu_text.append("")
-            menu_text.append("A. Add new function type")
-        
-        menu_text.append("")
-        menu_text.append(f"Current: {self.selected_action.upper()}")
-        if self.selected_action == "function":
-            menu_text.append(f"Type: {self.selected_function_type.upper()}")
-            if self.selected_function:
-                menu_text.append(f"Function: {self.selected_function}")
-        menu_text.append("")
-        menu_text.append("ESC. Cancel")
-        
-        max_width = max(self.font.render(line, True, COLOR_UI_TEXT).get_width() for line in menu_text)
-        line_height = self.font.get_height()
-        menu_width = max_width + 40
-        menu_height = len(menu_text) * (line_height + 2) + 40
-        
-        screen_w, screen_h = self.screen.get_size()
-        menu_x = (screen_w - menu_width) // 2
-        menu_y = (screen_h - menu_height) // 2
-        
-        s = pygame.Surface((menu_width, menu_height), pygame.SRCALPHA)
-        s.fill(COLOR_MENU_BG)
-        self.screen.blit(s, (menu_x, menu_y))
-        pygame.draw.rect(self.screen, COLOR_MENU_BORDER, (menu_x, menu_y, menu_width, menu_height), 2)
-        
-        y = menu_y + 20
-        for line in menu_text:
-            if line.startswith("==="):
-                surf = self.font_large.render(line, True, COLOR_UI_TEXT)
-            else:
-                surf = self.font.render(line, True, COLOR_UI_TEXT)
-            self.screen.blit(surf, (menu_x + 20, y))
-            y += line_height + 2
-    
-    def draw_context_menu(self):
-        if not self.context_menu_pos or not self.context_menu_items:
-            return
-        
-        line_height = self.font.get_height()
-        max_width = max(self.font.render(item[0], True, COLOR_UI_TEXT).get_width() for item in self.context_menu_items)
-        menu_width = max_width + 40
-        menu_height = len(self.context_menu_items) * (line_height + 10) + 10
-        
-        mx, my = self.context_menu_pos
-        
-        s = pygame.Surface((menu_width, menu_height), pygame.SRCALPHA)
-        s.fill(COLOR_MENU_BG)
-        self.screen.blit(s, (mx, my))
-        pygame.draw.rect(self.screen, COLOR_MENU_BORDER, (mx, my, menu_width, menu_height), 2)
-        
-        mouse_x, mouse_y = pygame.mouse.get_pos()
-        
-        y = my + 5
-        for i, (text, _) in enumerate(self.context_menu_items):
-            item_rect = pygame.Rect(mx + 5, y, menu_width - 10, line_height + 4)
-            
-            if item_rect.collidepoint(mouse_x, mouse_y):
-                pygame.draw.rect(self.screen, COLOR_UI_HIGHLIGHT, item_rect)
-            
-            surf = self.font.render(text, True, COLOR_UI_TEXT)
-            self.screen.blit(surf, (mx + 20, y + 2))
-            y += line_height + 10
-    
-    def handle_context_menu_click(self, pos):
-        if not self.context_menu_pos or not self.context_menu_items:
-            return
-        
-        mx, my = self.context_menu_pos
-        line_height = self.font.get_height()
-        
-        y = my + 5
-        for text, callback in self.context_menu_items:
-            item_rect = pygame.Rect(mx + 5, y, 300, line_height + 4)
-            if item_rect.collidepoint(pos):
-                callback()
-                self.context_menu_pos = None
-                self.context_menu_items = []
-                return
-            y += line_height + 10
-        
-        self.context_menu_pos = None
-        self.context_menu_items = []
-    
-    def show_context_menu_at(self, pos, items):
-        self.context_menu_pos = pos
-        self.context_menu_items = items
-    
+        xa, ya = x - self.grid_offset, y - self.grid_offset
+        return (round(xa / self.snap_inches) * self.snap_inches + self.grid_offset,
+                round(ya / self.snap_inches) * self.snap_inches + self.grid_offset)
+
     def get_function_at_pos(self, fx, fy):
         for func in self.functions:
-            dx = abs(fx - func.x)
-            dy = abs(fy - func.y)
-            if dx < func.width / 2 and dy < func.height / 2:
+            if abs(fx - func.x) < func.width / 2 and abs(fy - func.y) < func.height / 2:
                 return func
         return None
-    
+
     def is_click_on_start(self, fx, fy):
-        """Check if a click position is on the start position"""
         if not self.start_pos:
             return False
-        
         sx, sy, _ = self.start_pos
-        dx = abs(fx - sx)
-        dy = abs(fy - sy)
-        # 18 inch radius for start position
-        return math.sqrt(dx*dx + dy*dy) < 18
-    
-    def save_path(self):
+        return math.hypot(fx - sx, fy - sy) < 18
+
+    # ── File I/O ─────────────────────────────────────────────────
+    def new_path(self):
+        self.push_undo()
+        self.path_points.clear()
+        self.functions.clear()
+        self.start_pos = None
+        self.last_point = None
+        self.current_path_file = None
+        self.current_functions_file = None
+        self.status_msg = "New path created"
+
+    def save_to(self, path_file, func_file):
         data = {"path": [{"x": x, "y": y} for x, y in self.path_points]}
-        with open(OUTPUT_FILE, "w") as f:
+        with open(path_file, "w") as f:
             json.dump(data, f, indent=2)
-        print(f"Saved path: {OUTPUT_FILE}")
-        self.save_functions()
-    
-    def load_path(self):
+        fdata = {
+            "functions": [fn.to_dict() for fn in self.functions],
+            "templates": self.function_templates,
+        }
+        if self.start_pos:
+            fdata["start_pos"] = {"x": self.start_pos[0], "y": self.start_pos[1],
+                                  "rotation": self.start_pos[2]}
+        with open(func_file, "w") as f:
+            json.dump(fdata, f, indent=2)
+        self.current_path_file = path_file
+        self.current_functions_file = func_file
+        self.status_msg = f"Saved → {os.path.basename(path_file)}"
+
+    def save_all(self):
+        self.save_to(self.current_path_file or OUTPUT_FILE,
+                     self.current_functions_file or FUNCTIONS_FILE)
+
+    def load_from(self, filepath):
+        self.push_undo()
+        directory = os.path.dirname(filepath) or "."
+        base = os.path.basename(filepath)
+        if os.path.exists(filepath):
+            with open(filepath, "r") as f:
+                data = json.load(f)
+            if "path" in data:
+                self.path_points = [(p["x"], p["y"]) for p in data.get("path", [])]
+                self.current_path_file = filepath
+            if "functions" in data:
+                self.functions = [Function.from_dict(fn) for fn in data.get("functions", [])]
+                self.function_templates = data.get("templates", self.function_templates)
+                if "start_pos" in data:
+                    sp = data["start_pos"]
+                    self.start_pos = (sp["x"], sp["y"], sp["rotation"])
+                self.current_functions_file = filepath
+        # Try companion file
+        if "path" in base.lower():
+            companion = os.path.join(directory, base.replace("path", "functions"))
+        elif "functions" in base.lower():
+            companion = os.path.join(directory, base.replace("functions", "path"))
+        else:
+            companion = None
+        if companion and os.path.exists(companion) and companion != filepath:
+            with open(companion, "r") as f:
+                cdata = json.load(f)
+            if "path" in cdata:
+                self.path_points = [(p["x"], p["y"]) for p in cdata.get("path", [])]
+                self.current_path_file = companion
+            if "functions" in cdata:
+                self.functions = [Function.from_dict(fn) for fn in cdata.get("functions", [])]
+                self.function_templates = cdata.get("templates", self.function_templates)
+                if "start_pos" in cdata:
+                    sp = cdata["start_pos"]
+                    self.start_pos = (sp["x"], sp["y"], sp["rotation"])
+                self.current_functions_file = companion
+        self.status_msg = f"Loaded {os.path.basename(filepath)}"
+
+    def load_all(self):
         if os.path.exists(OUTPUT_FILE):
-            try:
-                with open(OUTPUT_FILE, "r") as f:
-                    data = json.load(f)
-                    self.path_points = [(p["x"], p["y"]) for p in data.get("path", [])]
-                print(f"Loaded {len(self.path_points)} path points")
-            except Exception as e:
-                print(f"Error loading path: {e}")
-        self.load_functions()
-    
-    def handle_events(self):
-        for event in pygame.event.get():
-            if event.type == QUIT:
-                return False
-            
-            if event.type == VIDEORESIZE:
-                self.update_background_scale()
-            
-            if event.type == KEYDOWN:
-                if event.key == K_ESCAPE:
-                    if self.show_help:
-                        self.show_help = False
-                    elif self.show_function_menu:
-                        self.show_function_menu = False
-                        self.placing_function = False
-                    elif self.context_menu_pos:
-                        self.context_menu_pos = None
-                        self.context_menu_items = []
-                    else:
-                        return False
-                
-                if event.key == K_h:
-                    self.show_help = not self.show_help
-                
-                if event.key == K_p and not self.show_help and not self.show_function_menu:
-                    # Toggle placing start position
-                    self.placing_start = True
-                    self.placing_function = False
-                    print("Click to place start position (right-click to adjust rotation after placing)")
-                
-                if event.key == K_s and not self.show_help and not self.show_function_menu:
-                    self.save_path()
-                
-                if event.key == K_l and not self.show_help and not self.show_function_menu:
-                    self.load_path()
-                
-                if event.key == K_c and not self.show_help and not self.show_function_menu:
-                    self.path_points.clear()
-                    self.last_point = None
-                    print("Cleared path")
-                
-                if event.key == K_g and not self.show_help and not self.show_function_menu:
-                    self.snap_enabled = not self.snap_enabled
-                    print(f"Grid snapping: {self.snap_enabled}")
-                
-                if event.key == K_f and not self.show_help:
-                    if event.mod & KMOD_CTRL:
-                        self.toggle_fullscreen()
-                    else:
-                        self.show_function_menu = not self.show_function_menu
-                
-                if event.key == K_F11:
-                    self.toggle_fullscreen()
-                
-                if event.key == K_BACKQUOTE:
-                    self.grid_offset_mode = not self.grid_offset_mode
-                    print(f"Grid offset mode: {self.grid_offset_mode}")
-                
-                if event.key in (K_EQUALS, K_PLUS):
-                    if self.grid_offset_mode:
-                        self.grid_offset += 4
-                        print(f"Grid offset: {self.grid_offset}")
-                    else:
-                        self.snap_inches += 4
-                        print(f"Snap size: {self.snap_inches}")
-                
-                if event.key == K_MINUS:
-                    if self.grid_offset_mode:
-                        self.grid_offset -= 4
-                        print(f"Grid offset: {self.grid_offset}")
-                    else:
-                        self.snap_inches = max(1, self.snap_inches - 4)
-                        print(f"Snap size: {self.snap_inches}")
-                
-                # Function menu number keys
-                if self.show_function_menu:
-                    if event.key == K_r:
-                        # Rotate only
-                        self.selected_action = "rotate_only"
-                        self.selected_function = None
-                        self.placing_function = True
-                        self.show_function_menu = False
-                        print("Placing: Rotate Only")
-                    elif event.key == K_f:
-                        # Function action
-                        self.selected_action = "function"
-                        print("Action: Function")
-                    elif event.key == K_w:
-                        # Wait till complete
-                        self.selected_function_type = "wait_till"
-                        print("Type: Wait Till Complete")
-                    elif event.key == K_m:
-                        # Run while moving
-                        self.selected_function_type = "run_while_moving"
-                        print("Type: Run While Moving")
-                    elif K_1 <= event.key <= K_9:
-                        if self.selected_action == "function":
-                            idx = event.key - K_1
-                            if idx < len(self.function_templates):
-                                self.selected_function = self.function_templates[idx]
-                                self.placing_function = True
-                                self.show_function_menu = False
-                                print(f"Placing function: {self.selected_function} ({self.selected_function_type})")
-                    elif event.key == K_a:
-                        # Add new function type
-                        print("Enter function name in console:")
-                        # This is a simplified version; in a full implementation,
-                        # you'd want a text input dialog
-            
-            if event.type == MOUSEWHEEL:
-                if not self.show_help and not self.show_function_menu:
-                    self.zoom(event.y, pygame.mouse.get_pos())
-            
-            if event.type == MOUSEBUTTONDOWN:
-                if self.context_menu_pos:
-                    self.handle_context_menu_click(event.pos)
-                    continue
-                
-                if event.button == 1:  # Left click
-                    if not self.show_help and not self.show_function_menu:
-                        if self.placing_start:
-                            # Place start position
-                            fx, fy = self.screen_to_field(*event.pos)
-                            fx, fy = self.snap_coord(fx, fy)
-                            self.start_pos = (fx, fy, 0)  # Default rotation 0
-                            self.placing_start = False
-                            print(f"Placed start position at ({fx:.1f}, {fy:.1f})")
-                        elif self.placing_function:
-                            fx, fy = self.screen_to_field(*event.pos)
-                            fx, fy = self.snap_coord(fx, fy)
-                            
-                            if self.selected_action == "rotate_only":
-                                # For rotate only, use rotation as the "name"
-                                new_func = Function("rotate", fx, fy, 0, "wait_till", "rotate_only")
-                                self.functions.append(new_func)
-                                print(f"Placed rotation point at ({fx:.1f}, {fy:.1f})")
-                            elif self.selected_function:
-                                new_func = Function(
-                                    self.selected_function, 
-                                    fx, fy, 
-                                    0, 
-                                    self.selected_function_type,
-                                    self.selected_action
-                                )
-                                self.functions.append(new_func)
-                                print(f"Placed {self.selected_function} ({self.selected_function_type}) at ({fx:.1f}, {fy:.1f})")
-                        else:
-                            # Only allow path drawing if start position is set
-                            if not self.start_pos:
-                                print("⚠ Please place start position first (Press P)")
-                            else:
-                                self.drawing = True
-                                fx, fy = self.screen_to_field(*event.pos)
-                                fx, fy = self.snap_coord(fx, fy)
-                                
-                                # If this is the first point and path is empty, start from start position
-                                if len(self.path_points) == 0:
-                                    start_x, start_y, _ = self.start_pos
-                                    self.path_points.append((start_x, start_y))
-                                    self.last_point = (start_x, start_y)
-                                    print(f"Path starting from start position ({start_x:.1f}, {start_y:.1f})")
-                                
-                                # Check if clicking near a function - snap to it
-                                clicked_func = self.get_function_at_pos(fx, fy)
-                                if clicked_func:
-                                    fx, fy = clicked_func.x, clicked_func.y
-                                    print(f"Snapped to function '{clicked_func.name}' at ({fx:.1f}, {fy:.1f})")
-                                
-                                self.last_point = (fx, fy)
-                                self.path_points.append(self.last_point)
-                
-                elif event.button == 2:  # Middle click
-                    self.panning = True
-                    self.pan_start = event.pos
-                    self.pan_offset_start = (self.offset_x, self.offset_y)
-                
-                elif event.button == 3:  # Right click
-                    if not self.show_help and not self.show_function_menu:
-                        fx, fy = self.screen_to_field(*event.pos)
-                        
-                        # Check if clicking on start position
-                        if self.is_click_on_start(fx, fy):
-                            # Start position context menu
-                            items = [
-                                ("Delete Start Position", lambda: setattr(self, 'start_pos', None)),
-                                ("Rotate +45°", lambda: setattr(self, 'start_pos', 
-                                    (self.start_pos[0], self.start_pos[1], (self.start_pos[2] + 45) % 360))),
-                                ("Rotate +90°", lambda: setattr(self, 'start_pos', 
-                                    (self.start_pos[0], self.start_pos[1], (self.start_pos[2] + 90) % 360))),
-                                ("Rotate -45°", lambda: setattr(self, 'start_pos', 
-                                    (self.start_pos[0], self.start_pos[1], (self.start_pos[2] - 45) % 360))),
-                                ("Set Rotation to 0°", lambda: setattr(self, 'start_pos', 
-                                    (self.start_pos[0], self.start_pos[1], 0))),
-                                ("Set Rotation to 90°", lambda: setattr(self, 'start_pos', 
-                                    (self.start_pos[0], self.start_pos[1], 90))),
-                                ("Set Rotation to 180°", lambda: setattr(self, 'start_pos', 
-                                    (self.start_pos[0], self.start_pos[1], 180))),
-                                ("Set Rotation to 270°", lambda: setattr(self, 'start_pos', 
-                                    (self.start_pos[0], self.start_pos[1], 270))),
-                            ]
-                            self.show_context_menu_at(event.pos, items)
-                            continue
-                        
-                        func = self.get_function_at_pos(fx, fy)
-                        
-                        if func:
-                            # Function context menu
-                            items = [
-                                ("Delete Function", lambda f=func: self.functions.remove(f)),
-                                ("Rotate +45°", lambda f=func: setattr(f, 'rotation', (f.rotation + 45) % 360)),
-                                ("Rotate +90°", lambda f=func: setattr(f, 'rotation', (f.rotation + 90) % 360)),
-                                ("Rotate -45°", lambda f=func: setattr(f, 'rotation', (f.rotation - 45) % 360)),
-                                ("Set Rotation to 0°", lambda f=func: setattr(f, 'rotation', 0)),
-                            ]
-                            
-                            # Add type toggle if it's a function action
-                            if func.action == "function":
-                                if func.function_type == "wait_till":
-                                    items.insert(1, ("Change to Run While Moving", 
-                                                    lambda f=func: setattr(f, 'function_type', 'run_while_moving')))
-                                else:
-                                    items.insert(1, ("Change to Wait Till Complete", 
-                                                    lambda f=func: setattr(f, 'function_type', 'wait_till')))
-                            
-                            self.show_context_menu_at(event.pos, items)
-                        elif self.placing_function:
-                            # Cancel placement
-                            self.placing_function = False
-                            self.selected_function = None
-                        elif self.placing_start:
-                            # Cancel start placement
-                            self.placing_start = False
-                        else:
-                            # General context menu
-                            items = [
-                                ("Clear Path", lambda: self.path_points.clear()),
-                                ("Save", lambda: self.save_path()),
-                                ("Load", lambda: self.load_path()),
-                                ("Toggle Snap", lambda: setattr(self, 'snap_enabled', not self.snap_enabled)),
-                            ]
-                            self.show_context_menu_at(event.pos, items)
-            
-            if event.type == MOUSEBUTTONUP:
-                if event.button == 1:
-                    self.drawing = False
-                    self.last_point = None
-                elif event.button == 2:
-                    self.panning = False
-                    self.pan_start = None
-            
-            if event.type == MOUSEMOTION:
-                if self.panning and self.pan_start:
-                    dx = event.pos[0] - self.pan_start[0]
-                    dy = event.pos[1] - self.pan_start[1]
-                    self.offset_x = self.pan_offset_start[0] + dx
-                    self.offset_y = self.pan_offset_start[1] + dy
-        
-        # Handle continuous drawing
-        if self.drawing and self.last_point and not self.show_help and not self.show_function_menu:
-            mx, my = pygame.mouse.get_pos()
+            with open(OUTPUT_FILE, "r") as f:
+                data = json.load(f)
+                self.path_points = [(p["x"], p["y"]) for p in data.get("path", [])]
+        if os.path.exists(FUNCTIONS_FILE):
+            with open(FUNCTIONS_FILE, "r") as f:
+                data = json.load(f)
+                self.functions = [Function.from_dict(fn) for fn in data.get("functions", [])]
+                self.function_templates = data.get("templates", self.function_templates)
+                if "start_pos" in data:
+                    sp = data["start_pos"]
+                    self.start_pos = (sp["x"], sp["y"], sp["rotation"])
+        self.current_path_file = OUTPUT_FILE
+        self.current_functions_file = FUNCTIONS_FILE
+        self.status_msg = f"Loaded {len(self.path_points)} pts, {len(self.functions)} funcs"
+
+    # ── Background ───────────────────────────────────────────────
+    def load_background(self):
+        if os.path.exists(BACKGROUND_IMAGE):
+            w, h, _, data = dpg.load_image(BACKGROUND_IMAGE)
+            with dpg.texture_registry():
+                self.bg_texture_id = dpg.add_static_texture(width=w, height=h, default_value=data)
+
+    # ── Drawing helpers ──────────────────────────────────────────
+    def _draw_arrow(self, dl, cx, cy, angle_deg, length, color, thickness=2):
+        angle = math.radians(angle_deg)
+        ex = cx + math.cos(angle) * length
+        ey = cy + math.sin(angle) * length
+        dpg.draw_line((cx, cy), (ex, ey), color=color, thickness=thickness, parent=dl)
+        sz = 8
+        la = angle + math.radians(150)
+        ra = angle - math.radians(150)
+        dpg.draw_triangle(
+            (ex, ey),
+            (ex + math.cos(la) * sz, ey + math.sin(la) * sz),
+            (ex + math.cos(ra) * sz, ey + math.sin(ra) * sz),
+            color=color, fill=color, parent=dl)
+
+    # ── Main render ──────────────────────────────────────────────
+    def render(self):
+        dl = "canvas"
+        dpg.delete_item(dl, children_only=True)
+
+        if self.bg_texture_id:
+            ox, oy = self.offset_x, self.offset_y
+            fw = FIELD_WIDTH_IN * self.scale
+            fh = FIELD_HEIGHT_IN * self.scale
+            dpg.draw_image(self.bg_texture_id, (ox, oy), (ox + fw, oy + fh), parent=dl)
+
+        if self.show_grid:
+            self._draw_grid(dl)
+
+        # Render active environment objects on main canvas
+        if self.active_env and self.env_editor:
+            self.env_editor.render_on_main(dl, self.field_to_screen)
+
+        self._draw_path(dl)
+        self._draw_start(dl)
+        self._draw_functions(dl)
+        self._draw_cursor(dl)
+
+    def _draw_grid(self, dl):
+        spacing = self.snap_inches * self.scale
+        if spacing < 4:
+            return
+        off_px = self.grid_offset * self.scale
+        fw = FIELD_WIDTH_IN * self.scale
+        fh = FIELD_HEIGHT_IN * self.scale
+        ox, oy = self.offset_x, self.offset_y
+        x = ox + (off_px % spacing)
+        while x <= ox + fw:
+            dpg.draw_line((x, oy), (x, oy + fh), color=COL_GRID, thickness=1, parent=dl)
+            x += spacing
+        y = oy + (off_px % spacing)
+        while y <= oy + fh:
+            dpg.draw_line((ox, y), (ox + fw, y), color=COL_GRID, thickness=1, parent=dl)
+            y += spacing
+
+    def _draw_path(self, dl):
+        pcol = tuple(self.prefs["path_color"])
+        thick = self.prefs["path_thickness"]
+        radius = self.prefs["point_radius"]
+        if len(self.path_points) < 2:
+            if len(self.path_points) == 1:
+                sx, sy = self.field_to_screen(*self.path_points[0])
+                dpg.draw_circle((sx, sy), radius, color=pcol, fill=pcol, parent=dl)
+            return
+        pts = [self.field_to_screen(x, y) for x, y in self.path_points]
+        dpg.draw_polyline(pts, color=pcol, thickness=thick, parent=dl)
+        if self.show_path_points:
+            for sx, sy in pts:
+                dpg.draw_circle((sx, sy), radius, color=COL_PATH_POINT, fill=COL_PATH_POINT, parent=dl)
+
+    def _draw_start(self, dl):
+        if not self.start_pos:
+            return
+        x, y, rot = self.start_pos
+        sx, sy = self.field_to_screen(x, y)
+        r = max(8, int(18 * self.scale))
+        dpg.draw_circle((sx, sy), r, color=COL_START, thickness=3, parent=dl)
+        dpg.draw_circle((sx, sy), max(3, r - 5), color=COL_START_INNER, thickness=2, parent=dl)
+        self._draw_arrow(dl, sx, sy, rot, r + 10, COL_START, 3)
+        if self.show_labels:
+            dpg.draw_text((sx - 22, sy - r - 20), "START", color=COL_START, size=14, parent=dl)
+            dpg.draw_text((sx - 12, sy + r + 5), f"{rot}°", color=(200, 200, 200, 255), size=12, parent=dl)
+
+    def _draw_functions(self, dl):
+        for func in self.functions:
+            sx, sy = self.field_to_screen(func.x, func.y)
+            w = max(int(func.width * self.scale), 8)
+            h = max(int(func.height * self.scale), 8)
+            color = (COL_FUNC_ROT if func.action == "rotate_only"
+                     else COL_FUNC_WAIT if func.function_type == "wait_till"
+                     else COL_FUNC_MOVE)
+            if func.action == "rotate_only":
+                dpg.draw_circle((sx, sy), w // 2, color=color, thickness=2, parent=dl)
+            else:
+                dpg.draw_rectangle((sx - w // 2, sy - h // 2), (sx + w // 2, sy + h // 2),
+                                   color=color, thickness=2, parent=dl)
+                if func.function_type != "wait_till":
+                    dpg.draw_line((sx - w // 2, sy - h // 2), (sx + w // 2, sy + h // 2),
+                                 color=color, thickness=1, parent=dl)
+            a = math.radians(func.rotation)
+            dpg.draw_line((sx, sy), (sx + math.cos(a) * w // 2, sy + math.sin(a) * h // 2),
+                          color=color, thickness=2, parent=dl)
+            if self.show_labels:
+                lbl = (f"R:{func.rotation}°" if func.action == "rotate_only"
+                       else f"{'W' if func.function_type == 'wait_till' else 'M'}:{func.name}")
+                dpg.draw_text((sx - len(lbl) * 3.5, sy - h // 2 - 18), lbl, color=color, size=12, parent=dl)
+
+    def _draw_cursor(self, dl):
+        if not dpg.is_item_hovered("drawlist_window"):
+            return
+        mpos = dpg.get_mouse_pos(local=False)
+        wpos = dpg.get_item_pos("canvas")
+        mx, my = mpos[0] - wpos[0], mpos[1] - wpos[1]
+        fx, fy = self.snap_coord(*self.screen_to_field(mx, my))
+        sx, sy = self.field_to_screen(fx, fy)
+
+        if self.placing_start:
+            r = max(8, int(18 * self.scale))
+            dpg.draw_circle((sx, sy), r, color=(255, 255, 255, 128), thickness=2, parent=dl)
+            dpg.draw_line((sx, sy), (sx + r + 10, sy), color=(255, 255, 255, 128), thickness=2, parent=dl)
+            dpg.draw_text((sx - 30, sy - r - 20), "START (0°)", color=(255, 255, 255, 180), size=12, parent=dl)
+        elif self.placing_function:
+            w = max(int(12 * self.scale), 8)
+            if self.selected_action == "rotate_only":
+                dpg.draw_circle((sx, sy), w // 2, color=COL_FUNC_ROT, thickness=2, parent=dl)
+                dpg.draw_text((sx - 30, sy - w // 2 - 18), "Rotate Only", color=COL_FUNC_ROT, size=12, parent=dl)
+            else:
+                col = COL_FUNC_WAIT if self.selected_function_type == "wait_till" else COL_FUNC_MOVE
+                dpg.draw_rectangle((sx - w // 2, sy - w // 2), (sx + w // 2, sy + w // 2),
+                                   color=col, thickness=2, parent=dl)
+                prefix = "Wait" if self.selected_function_type == "wait_till" else "Move"
+                lbl = f"{prefix}: {self.selected_function}"
+                dpg.draw_text((sx - len(lbl) * 3.5, sy - w // 2 - 18), lbl, color=col, size=12, parent=dl)
+        elif self.start_pos and len(self.path_points) == 0 and not self.placing_function:
+            ssx, ssy = self.field_to_screen(self.start_pos[0], self.start_pos[1])
+            dpg.draw_line((ssx, ssy), (sx, sy), color=COL_HINT, thickness=1, parent=dl)
+            dpg.draw_text((sx + 10, sy - 16), "Path starts from START", color=COL_HINT, size=12, parent=dl)
+
+    # ── Mouse handling ───────────────────────────────────────────
+    def _local_mouse(self):
+        mpos = dpg.get_mouse_pos(local=False)
+        wpos = dpg.get_item_pos("canvas")
+        return mpos[0] - wpos[0], mpos[1] - wpos[1]
+
+    def on_mouse_down(self, sender, app_data):
+        button = app_data
+        if not dpg.is_item_hovered("drawlist_window"):
+            return
+        mx, my = self._local_mouse()
+        fx, fy = self.screen_to_field(mx, my)
+
+        if button == 0:
+            if self.placing_start:
+                self.push_undo()
+                sfx, sfy = self.snap_coord(fx, fy)
+                self.start_pos = (sfx, sfy, 0)
+                self.placing_start = False
+                self.status_msg = f"Start placed at ({sfx:.1f}, {sfy:.1f}). Right-click to rotate."
+                return
+            if self.placing_function:
+                self.push_undo()
+                sfx, sfy = self.snap_coord(fx, fy)
+                if self.selected_action == "rotate_only":
+                    self.functions.append(Function("rotate", sfx, sfy, 0, "wait_till", "rotate_only"))
+                    self.status_msg = f"Rotation point at ({sfx:.1f}, {sfy:.1f})"
+                elif self.selected_function:
+                    self.functions.append(Function(self.selected_function, sfx, sfy, 0,
+                                                   self.selected_function_type, self.selected_action))
+                    self.status_msg = f"Placed {self.selected_function} at ({sfx:.1f}, {sfy:.1f})"
+                return
+            if not self.start_pos:
+                self.status_msg = "⚠ Place START position first (press P)"
+                return
+            self.push_undo()
+            self.drawing = True
+            sfx, sfy = self.snap_coord(fx, fy)
+            clicked_func = self.get_function_at_pos(sfx, sfy)
+            if clicked_func:
+                sfx, sfy = clicked_func.x, clicked_func.y
+            if len(self.path_points) == 0:
+                sx2, sy2, _ = self.start_pos
+                self.path_points.append((sx2, sy2))
+                self.last_point = (sx2, sy2)
+            self.last_point = (sfx, sfy)
+            self.path_points.append(self.last_point)
+
+        elif button == 1:
+            if self.placing_function or self.placing_start:
+                self.placing_function = False
+                self.placing_start = False
+                self.selected_function = None
+                self.status_msg = "Placement cancelled"
+                return
+            if self.is_click_on_start(fx, fy):
+                dpg.configure_item("ctx_start", show=True)
+                return
+            func = self.get_function_at_pos(fx, fy)
+            if func:
+                self._ctx_func = func
+                if func.action == "function":
+                    lbl = "Change to Run While Moving" if func.function_type == "wait_till" else "Change to Wait Till"
+                    dpg.set_item_label("ctx_func_toggle_type", lbl)
+                    dpg.configure_item("ctx_func_toggle_type", show=True)
+                else:
+                    dpg.configure_item("ctx_func_toggle_type", show=False)
+                dpg.configure_item("ctx_func", show=True)
+                return
+            dpg.configure_item("ctx_general", show=True)
+
+        elif button == 2:
+            self.panning = True
+            gpos = dpg.get_mouse_pos(local=False)
+            self.pan_start = (gpos[0], gpos[1])
+            self.pan_offset_start = (self.offset_x, self.offset_y)
+
+    def on_mouse_release(self, sender, app_data):
+        if app_data == 0:
+            self.drawing = False
+            self.last_point = None
+        elif app_data == 2:
+            self.panning = False
+            self.pan_start = None
+
+    def on_mouse_move(self, sender, app_data):
+        if self.panning and self.pan_start:
+            gpos = dpg.get_mouse_pos(local=False)
+            self.offset_x = self.pan_offset_start[0] + gpos[0] - self.pan_start[0]
+            self.offset_y = self.pan_offset_start[1] + gpos[1] - self.pan_start[1]
+
+        if self.drawing and self.last_point and dpg.is_item_hovered("drawlist_window"):
+            mx, my = self._local_mouse()
             fx, fy = self.screen_to_field(mx, my)
-            
-            # Check if near a function - snap to it
-            nearby_func = self.get_function_at_pos(fx, fy)
-            if nearby_func:
-                fx, fy = nearby_func.x, nearby_func.y
+            nearby = self.get_function_at_pos(fx, fy)
+            if nearby:
+                fx, fy = nearby.x, nearby.y
             else:
                 fx, fy = self.snap_coord(fx, fy)
-            
             lx, ly = self.last_point
-            dx = fx - lx
-            dy = fy - ly
-            
+            dx, dy = fx - lx, fy - ly
             if abs(dx) > 0.05 or abs(dy) > 0.05:
                 angle = math.atan2(dy, dx)
                 best = min(SNAP_ANGLES, key=lambda a: abs(a - angle))
-                
-                new_x = lx + math.cos(best) * STEP_SIZE
-                new_y = ly + math.sin(best) * STEP_SIZE
-                
-                # Check if the new point should snap to a function
-                check_func = self.get_function_at_pos(new_x, new_y)
-                if check_func:
-                    new_x, new_y = check_func.x, check_func.y
+                step = self.prefs["step_size"]
+                nx, ny = lx + math.cos(best) * step, ly + math.sin(best) * step
+                check = self.get_function_at_pos(nx, ny)
+                if check:
+                    nx, ny = check.x, check.y
                 else:
-                    new_x, new_y = self.snap_coord(new_x, new_y)
-                
-                self.last_point = (new_x, new_y)
+                    nx, ny = self.snap_coord(nx, ny)
+                self.last_point = (nx, ny)
                 self.path_points.append(self.last_point)
-        
-        return True
-    
+
+    def on_mouse_wheel(self, sender, app_data):
+        if not dpg.is_item_hovered("drawlist_window"):
+            return
+        mx, my = self._local_mouse()
+        fx, fy = self.screen_to_field(mx, my)
+        old = self.scale
+        self.scale = max(MIN_SCALE, min(MAX_SCALE, self.scale + (1 if app_data > 0 else -1)))
+        if old != self.scale:
+            nsx, nsy = self.field_to_screen(fx, fy)
+            self.offset_x += mx - nsx
+            self.offset_y += my - nsy
+
+    # ── Keyboard ─────────────────────────────────────────────────
+    def on_key_press(self, sender, app_data):
+        key = app_data
+        if key == dpg.mvKey_H:
+            self._toggle("help_window")
+        elif key == dpg.mvKey_P:
+            self.placing_start = True
+            self.placing_function = False
+            self.status_msg = "Click on the field to place START position"
+        elif key == dpg.mvKey_S:
+            self.save_all()
+        elif key == dpg.mvKey_L:
+            self.load_all()
+        elif key == dpg.mvKey_C:
+            self.push_undo()
+            self.path_points.clear()
+            self.last_point = None
+            self.status_msg = "Path cleared"
+        elif key == dpg.mvKey_G:
+            self.snap_enabled = not self.snap_enabled
+            dpg.set_value("menu_toggle_snap", self.snap_enabled)
+            self.status_msg = f"Snap: {'ON' if self.snap_enabled else 'OFF'}"
+        elif key == dpg.mvKey_F:
+            self._toggle("function_window")
+        elif key == dpg.mvKey_Z:
+            self.undo()
+        elif key == dpg.mvKey_Y:
+            self.redo()
+        elif key == dpg.mvKey_Escape:
+            if self.placing_function or self.placing_start:
+                self.placing_function = False
+                self.placing_start = False
+                self.selected_function = None
+                self.status_msg = "Placement cancelled"
+            else:
+                dpg.configure_item("help_window", show=False)
+                dpg.configure_item("function_window", show=False)
+
+    def _toggle(self, tag):
+        dpg.configure_item(tag, show=not dpg.get_item_configuration(tag)["show"])
+
+    # ── Context menu callbacks ───────────────────────────────────
+    def ctx_start_delete(self):
+        self.push_undo(); self.start_pos = None; self.status_msg = "Start removed"
+
+    def ctx_start_rotate(self, delta):
+        if self.start_pos:
+            self.push_undo()
+            x, y, r = self.start_pos
+            self.start_pos = (x, y, (r + delta) % 360)
+            self.status_msg = f"Start rotation: {self.start_pos[2]}°"
+
+    def ctx_start_set_rot(self, deg):
+        if self.start_pos:
+            self.push_undo()
+            self.start_pos = (self.start_pos[0], self.start_pos[1], deg)
+            self.status_msg = f"Start rotation: {deg}°"
+
+    def ctx_func_delete(self):
+        if hasattr(self, "_ctx_func") and self._ctx_func in self.functions:
+            self.push_undo(); self.functions.remove(self._ctx_func); self.status_msg = "Function deleted"
+
+    def ctx_func_rotate(self, delta):
+        if hasattr(self, "_ctx_func"):
+            self.push_undo()
+            self._ctx_func.rotation = (self._ctx_func.rotation + delta) % 360
+            self.status_msg = f"Function rotation: {self._ctx_func.rotation}°"
+
+    def ctx_func_toggle_type(self):
+        if hasattr(self, "_ctx_func"):
+            self.push_undo()
+            f = self._ctx_func
+            f.function_type = "run_while_moving" if f.function_type == "wait_till" else "wait_till"
+            self.status_msg = f"Function type: {f.function_type}"
+
+    # ── Function menu callbacks ──────────────────────────────────
+    def func_menu_set_action(self, action):
+        self.selected_action = action
+        if action == "rotate_only":
+            self.selected_function = None
+            self.placing_function = True
+            dpg.configure_item("function_window", show=False)
+            self.status_msg = "Click to place rotation point"
+
+    def func_menu_set_type(self, ftype):
+        self.selected_function_type = ftype
+
+    def func_menu_select(self, name):
+        self.selected_function = name
+        self.placing_function = True
+        dpg.configure_item("function_window", show=False)
+        self.status_msg = f"Click to place '{name}' ({self.selected_function_type})"
+
+    def func_menu_add_template(self, sender=None, app_data=None, user_data=None):
+        name = dpg.get_value("new_template_input").strip()
+        if name and name not in self.function_templates:
+            self.function_templates.append(name)
+            self._rebuild_template_list()
+            dpg.set_value("new_template_input", "")
+            self.status_msg = f"Added template: {name}"
+
+    def _rebuild_template_list(self):
+        dpg.delete_item("template_list_group", children_only=True)
+        for name in self.function_templates:
+            dpg.add_button(label=name, parent="template_list_group",
+                           callback=lambda s, a, u=name: self.func_menu_select(u), width=-1)
+
+    # ── View actions ─────────────────────────────────────────────
+    def zoom_in(self):
+        self.scale = min(MAX_SCALE, self.scale + 1)
+
+    def zoom_out(self):
+        self.scale = max(MIN_SCALE, self.scale - 1)
+
+    def zoom_reset(self):
+        self.scale = DEFAULT_SCALE; self.offset_x = 0.0; self.offset_y = 0.0
+
+    def zoom_fit(self):
+        vw = dpg.get_viewport_client_width()
+        vh = dpg.get_viewport_client_height() - MENU_BAR_HEIGHT
+        self.scale = max(MIN_SCALE, min(MAX_SCALE, int(min(vw / FIELD_WIDTH_IN, vh / FIELD_HEIGHT_IN))))
+        fw, fh = FIELD_WIDTH_IN * self.scale, FIELD_HEIGHT_IN * self.scale
+        self.offset_x = (vw - fw) / 2
+        self.offset_y = (vh - fh) / 2 + MENU_BAR_HEIGHT
+
+    # ── File dialog callbacks ────────────────────────────────────
+    def _on_open_file(self, sender, app_data):
+        if app_data and "file_path_name" in app_data:
+            self.load_from(app_data["file_path_name"])
+
+    def _on_save_file(self, sender, app_data):
+        if app_data and "file_path_name" in app_data:
+            fpath = app_data["file_path_name"]
+            d = os.path.dirname(fpath)
+            b = os.path.basename(fpath)
+            pf = fpath
+            ff = os.path.join(d, b.replace("path", "functions")) if "path" in b.lower() else os.path.join(d, "functions.json")
+            self.save_to(pf, ff)
+
+    # ── Preferences dialog ───────────────────────────────────────
+    def _prefs_open(self):
+        dpg.set_value("pref_step_size", self.prefs["step_size"])
+        dpg.set_value("pref_default_scale", self.prefs["default_scale"])
+        dpg.set_value("pref_snap_inches", self.prefs["snap_inches"])
+        dpg.set_value("pref_grid_offset", self.prefs["grid_offset"])
+        dpg.set_value("pref_path_thickness", self.prefs["path_thickness"])
+        dpg.set_value("pref_point_radius", self.prefs["point_radius"])
+        pc = self.prefs["path_color"]
+        dpg.set_value("pref_path_color", pc if len(pc) == 4 else pc + [255])
+        dpg.set_value("pref_auto_save", self.prefs["auto_save"])
+        dpg.configure_item("prefs_window", show=True)
+
+    def _prefs_apply(self):
+        self.prefs["step_size"] = dpg.get_value("pref_step_size")
+        self.prefs["default_scale"] = dpg.get_value("pref_default_scale")
+        self.prefs["snap_inches"] = dpg.get_value("pref_snap_inches")
+        self.prefs["grid_offset"] = dpg.get_value("pref_grid_offset")
+        self.prefs["path_thickness"] = dpg.get_value("pref_path_thickness")
+        self.prefs["point_radius"] = dpg.get_value("pref_point_radius")
+        self.prefs["path_color"] = [int(c) for c in dpg.get_value("pref_path_color")[:4]]
+        self.prefs["auto_save"] = dpg.get_value("pref_auto_save")
+        self._apply_prefs()
+        self._save_prefs()
+        dpg.configure_item("prefs_window", show=False)
+
+    # ── Environment integration ─────────────────────────────────
+    def _env_new(self):
+        self.env_editor.open_new()
+        self.active_env = self.env_editor.get_env()
+        self._sync_env_to_field()
+        self.status_msg = "New environment created"
+
+    def _env_open(self):
+        dpg.show_item("env_open_dialog")
+
+    def _env_open_file_cb(self, sender, app_data):
+        if app_data and "file_path_name" in app_data:
+            self.env_editor.open_file(app_data["file_path_name"])
+            self.active_env = self.env_editor.get_env()
+            self._sync_env_to_field()
+            self.status_msg = f"Environment loaded: {os.path.basename(app_data['file_path_name'])}"
+
+    def _env_close(self):
+        self.env_editor.close()
+        self.active_env = None
+        self.status_msg = "Environment closed"
+
+    def _on_env_saved(self, env):
+        self.active_env = env
+        self._sync_env_to_field()
+        self.status_msg = f"Environment saved"
+
+    def _on_env_closed(self):
+        self.active_env = None
+
+    def _sync_env_to_field(self):
+        """Sync environment metadata into path tracer globals."""
+        if not self.active_env:
+            return
+        m = self.active_env.metadata
+        # Update function templates from environment
+        env_func_names = [vf.name for vf in self.active_env.valid_functions]
+        for name in env_func_names:
+            if name not in self.function_templates:
+                self.function_templates.append(name)
+        self._rebuild_template_list()
+
+    def _run_convert(self):
+        self.save_all()
+        if os.path.exists("convert.py"):
+            result = subprocess.run(["python3", "convert.py"], capture_output=True, text=True)
+            self.status_msg = "Generated AutoData.java" if result.returncode == 0 else f"Error: {result.stderr.strip()[:80]}"
+        else:
+            self.status_msg = "convert.py not found in working directory"
+
+    # ═════════════════════════════════════════════════════════════
+    # BUILD
+    # ═════════════════════════════════════════════════════════════
+    def build(self):
+        dpg.create_context()
+        dpg.create_viewport(title="Path Tracer Pro — DearPyGui",
+                            width=INITIAL_WINDOW_W, height=INITIAL_WINDOW_H)
+
+        self.load_background()
+        self.load_all()
+
+        # ── File dialogs ──────────────────────────────────────
+        with dpg.file_dialog(directory_selector=False, show=False,
+                             callback=self._on_open_file, tag="open_file_dialog",
+                             width=600, height=400):
+            dpg.add_file_extension(".json", color=(0, 255, 0, 255))
+            dpg.add_file_extension(".*")
+
+        with dpg.file_dialog(directory_selector=False, show=False,
+                             callback=self._on_save_file, tag="save_file_dialog",
+                             width=600, height=400, default_filename="path.json"):
+            dpg.add_file_extension(".json", color=(0, 255, 0, 255))
+            dpg.add_file_extension(".*")
+
+        with dpg.file_dialog(directory_selector=False, show=False,
+                             callback=self._env_open_file_cb, tag="env_open_dialog",
+                             width=600, height=400):
+            dpg.add_file_extension(".frctenv", color=(0, 255, 100, 255))
+            dpg.add_file_extension(".*")
+
+        # ── Primary window ────────────────────────────────────
+        with dpg.window(label="Field", tag="drawlist_window", no_title_bar=True,
+                        no_move=True, no_resize=True, no_close=True,
+                        no_scrollbar=True, no_scroll_with_mouse=True):
+
+            # ══════════════════════════════════════════════════
+            #  MENU BAR
+            # ══════════════════════════════════════════════════
+            with dpg.menu_bar(tag="main_menu_bar"):
+
+                # ── File ──────────────────────────────────
+                with dpg.menu(label="File"):
+                    dpg.add_menu_item(label="New Path",
+                                      callback=lambda: self.new_path())
+                    dpg.add_menu_item(label="Open Path...",
+                                      shortcut="L",
+                                      callback=lambda: dpg.show_item("open_file_dialog"))
+                    dpg.add_menu_item(label="Save",
+                                      shortcut="S",
+                                      callback=lambda: self.save_all())
+                    dpg.add_menu_item(label="Save As...",
+                                      callback=lambda: dpg.show_item("save_file_dialog"))
+                    dpg.add_separator()
+                    dpg.add_menu_item(label="New Environment",
+                                      callback=lambda: self._env_new())
+                    dpg.add_menu_item(label="Open Environment...",
+                                      callback=lambda: self._env_open())
+                    dpg.add_menu_item(label="Close Environment",
+                                      callback=lambda: self._env_close())
+                    dpg.add_separator()
+                    dpg.add_menu_item(label="Preferences...",
+                                      callback=lambda: self._prefs_open())
+                    dpg.add_separator()
+                    dpg.add_menu_item(label="Exit",
+                                      callback=lambda: dpg.stop_dearpygui())
+
+                # ── Edit ──────────────────────────────────
+                with dpg.menu(label="Edit"):
+                    dpg.add_menu_item(label="Undo",
+                                      shortcut="Z",
+                                      callback=lambda: self.undo())
+                    dpg.add_menu_item(label="Redo",
+                                      shortcut="Y",
+                                      callback=lambda: self.redo())
+                    dpg.add_separator()
+                    dpg.add_menu_item(label="Copy",
+                                      callback=lambda: self.copy_selection())
+                    dpg.add_menu_item(label="Cut",
+                                      callback=lambda: self.cut_selection())
+                    dpg.add_menu_item(label="Paste",
+                                      callback=lambda: self.paste_clipboard())
+                    dpg.add_separator()
+                    dpg.add_menu_item(label="Clear Path",
+                                      shortcut="C",
+                                      callback=lambda: (self.push_undo(), self.path_points.clear(),
+                                                        setattr(self, 'status_msg', 'Path cleared')))
+                    dpg.add_menu_item(label="Clear All Functions",
+                                      callback=lambda: (self.push_undo(), self.functions.clear(),
+                                                        setattr(self, 'status_msg', 'Functions cleared')))
+
+                # ── View ──────────────────────────────────
+                with dpg.menu(label="View"):
+                    dpg.add_menu_item(label="Zoom In",    shortcut="+",  callback=lambda: self.zoom_in())
+                    dpg.add_menu_item(label="Zoom Out",   shortcut="-",  callback=lambda: self.zoom_out())
+                    dpg.add_menu_item(label="Reset Zoom",                callback=lambda: self.zoom_reset())
+                    dpg.add_menu_item(label="Fit to Window",             callback=lambda: self.zoom_fit())
+                    dpg.add_separator()
+                    dpg.add_menu_item(label="Toggle Grid", check=True, default_value=self.show_grid,
+                                      tag="menu_toggle_grid",
+                                      callback=lambda s, a: setattr(self, 'show_grid', a))
+                    dpg.add_menu_item(label="Toggle Path Points", check=True, default_value=self.show_path_points,
+                                      tag="menu_toggle_pts",
+                                      callback=lambda s, a: setattr(self, 'show_path_points', a))
+                    dpg.add_menu_item(label="Toggle Labels", check=True, default_value=self.show_labels,
+                                      tag="menu_toggle_labels",
+                                      callback=lambda s, a: setattr(self, 'show_labels', a))
+                    dpg.add_menu_item(label="Toggle Status Bar", check=True, default_value=self.show_status_bar,
+                                      tag="menu_toggle_status",
+                                      callback=lambda s, a: setattr(self, 'show_status_bar', a))
+                    dpg.add_separator()
+                    dpg.add_menu_item(label="Toggle Snap", check=True, default_value=self.snap_enabled,
+                                      tag="menu_toggle_snap",
+                                      callback=lambda s, a: (setattr(self, 'snap_enabled', a),
+                                                             setattr(self, 'status_msg', f"Snap: {'ON' if a else 'OFF'}")))
+
+                # ── Tools ─────────────────────────────────
+                with dpg.menu(label="Tools"):
+                    dpg.add_menu_item(label="Place Start Position", shortcut="P",
+                                      callback=lambda: (setattr(self, 'placing_start', True),
+                                                        setattr(self, 'placing_function', False),
+                                                        setattr(self, 'status_msg', 'Click to place START')))
+                    dpg.add_menu_item(label="Place Function...", shortcut="F",
+                                      callback=lambda: self._toggle("function_window"))
+                    dpg.add_separator()
+                    dpg.add_menu_item(label="Generate AutoData.java",
+                                      callback=lambda: self._run_convert())
+
+                # ── Help ──────────────────────────────────
+                with dpg.menu(label="Help"):
+                    dpg.add_menu_item(label="Keyboard Shortcuts", shortcut="H",
+                                      callback=lambda: self._toggle("help_window"))
+                    dpg.add_menu_item(label="About",
+                                      callback=lambda: self._toggle("about_window"))
+
+            # Canvas
+            dpg.add_drawlist(tag="canvas", width=INITIAL_WINDOW_W, height=INITIAL_WINDOW_H)
+
+        # ── Status bar ────────────────────────────────────────
+        with dpg.window(label="Status", tag="status_window", no_title_bar=True,
+                        no_move=True, no_resize=True, no_close=True,
+                        no_scrollbar=True, width=INITIAL_WINDOW_W, height=80,
+                        pos=[0, MENU_BAR_HEIGHT]):
+            dpg.add_text("", tag="status_text_1")
+            dpg.add_text("", tag="status_text_2")
+            dpg.add_text("", tag="status_text_3")
+            dpg.add_text("", tag="status_text_4")
+
+        # ── Help window ───────────────────────────────────────
+        with dpg.window(label="Help — Path Tracer Pro", tag="help_window",
+                        show=False, width=560, height=580, pos=[100, 50]):
+            dpg.add_text("KEYBOARD SHORTCUTS", color=(100, 200, 255))
+            dpg.add_separator()
+            dpg.add_spacer(height=5)
+            for k, d in [("H","Help"), ("P","Place start"), ("S","Save"), ("L","Load"),
+                         ("C","Clear path"), ("G","Toggle snap"), ("F","Function menu"),
+                         ("Z","Undo"), ("Y","Redo"), ("ESC","Cancel / close")]:
+                dpg.add_text(f"  [{k}]  {d}")
+            dpg.add_spacer(height=10)
+            dpg.add_text("MOUSE", color=(100, 200, 255))
+            dpg.add_separator()
+            dpg.add_spacer(height=5)
+            for k, d in [("Left drag","Draw path"), ("Right click","Context menu"),
+                         ("Middle drag","Pan"), ("Scroll","Zoom")]:
+                dpg.add_text(f"  {k}: {d}")
+            dpg.add_spacer(height=10)
+            dpg.add_text("WORKFLOW", color=(100, 200, 255))
+            dpg.add_separator()
+            dpg.add_spacer(height=5)
+            for line in ["1. P — place START", "2. Right-click START to set rotation",
+                         "3. F — add function waypoints", "4. Left-drag to draw path",
+                         "5. S — save", "6. Tools > Generate AutoData.java"]:
+                dpg.add_text(f"  {line}")
+            dpg.add_spacer(height=10)
+            dpg.add_text("LEGEND", color=(100, 200, 255))
+            dpg.add_separator()
+            dpg.add_spacer(height=5)
+            dpg.add_text("  White ○ + arrow: Start", color=COL_START)
+            dpg.add_text("  Yellow ○: Rotate Only", color=COL_FUNC_ROT)
+            dpg.add_text("  Green □: Wait Till Complete", color=COL_FUNC_WAIT)
+            dpg.add_text("  Blue □: Run While Moving", color=COL_FUNC_MOVE)
+            dpg.add_text("  Red line: Path", color=COL_PATH)
+
+        # ── About window ─────────────────────────────────────
+        with dpg.window(label="About", tag="about_window", show=False,
+                        width=360, height=180, pos=[250, 200], no_resize=True):
+            dpg.add_text("Path Tracer Pro", color=(100, 200, 255))
+            dpg.add_text("DearPyGui Edition")
+            dpg.add_spacer(height=8)
+            dpg.add_text("FTC autonomous path planning tool.")
+            dpg.add_text("Draw paths, place functions, export to Java.")
+            dpg.add_spacer(height=8)
+            dpg.add_text("144×144 in field  •  45° angle snapping")
+            dpg.add_spacer(height=8)
+            dpg.add_button(label="Close", width=-1,
+                           callback=lambda: dpg.configure_item("about_window", show=False))
+
+        # ── Preferences window ────────────────────────────────
+        with dpg.window(label="Preferences", tag="prefs_window", show=False,
+                        width=400, height=420, pos=[200, 100]):
+            dpg.add_text("PATH", color=(100, 200, 255)); dpg.add_separator()
+            dpg.add_input_float(label="Step Size (in)", tag="pref_step_size",
+                                default_value=self.prefs["step_size"],
+                                min_value=0.1, max_value=10.0, step=0.1, width=150)
+            dpg.add_input_int(label="Path Thickness (px)", tag="pref_path_thickness",
+                              default_value=self.prefs["path_thickness"],
+                              min_value=1, max_value=10, step=1, width=150)
+            dpg.add_input_int(label="Point Radius (px)", tag="pref_point_radius",
+                              default_value=self.prefs["point_radius"],
+                              min_value=1, max_value=10, step=1, width=150)
+            dpg.add_color_edit(label="Path Color", tag="pref_path_color",
+                               default_value=self.prefs["path_color"], no_alpha=False, width=150)
+            dpg.add_spacer(height=10)
+            dpg.add_text("GRID", color=(100, 200, 255)); dpg.add_separator()
+            dpg.add_input_int(label="Snap Size (in)", tag="pref_snap_inches",
+                              default_value=self.prefs["snap_inches"],
+                              min_value=1, max_value=72, step=4, width=150)
+            dpg.add_input_int(label="Grid Offset (in)", tag="pref_grid_offset",
+                              default_value=self.prefs["grid_offset"],
+                              min_value=-72, max_value=72, step=4, width=150)
+            dpg.add_spacer(height=10)
+            dpg.add_text("GENERAL", color=(100, 200, 255)); dpg.add_separator()
+            dpg.add_input_int(label="Default Zoom", tag="pref_default_scale",
+                              default_value=self.prefs["default_scale"],
+                              min_value=MIN_SCALE, max_value=MAX_SCALE, step=1, width=150)
+            dpg.add_checkbox(label="Auto-save on exit", tag="pref_auto_save",
+                             default_value=self.prefs["auto_save"])
+            dpg.add_spacer(height=15)
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Apply & Save", width=150, callback=lambda: self._prefs_apply())
+                dpg.add_button(label="Cancel", width=150,
+                               callback=lambda: dpg.configure_item("prefs_window", show=False))
+
+        # ── Function placement window ─────────────────────────
+        with dpg.window(label="Function Placement", tag="function_window",
+                        show=False, width=320, height=400, pos=[200, 100]):
+            dpg.add_text("ACTION TYPE", color=(100, 200, 255)); dpg.add_separator()
+            dpg.add_button(label="Rotate Only (R)", width=-1,
+                           callback=lambda: self.func_menu_set_action("rotate_only"))
+            dpg.add_button(label="Function (F)", width=-1,
+                           callback=lambda: self.func_menu_set_action("function"))
+            dpg.add_spacer(height=10)
+            dpg.add_text("FUNCTION TYPE", color=(100, 200, 255)); dpg.add_separator()
+            dpg.add_button(label="Wait Till Complete (W)", width=-1,
+                           callback=lambda: self.func_menu_set_type("wait_till"))
+            dpg.add_button(label="Run While Moving (M)", width=-1,
+                           callback=lambda: self.func_menu_set_type("run_while_moving"))
+            dpg.add_spacer(height=10)
+            dpg.add_text("TEMPLATES", color=(100, 200, 255)); dpg.add_separator()
+            with dpg.group(tag="template_list_group"):
+                pass
+            self._rebuild_template_list()
+            dpg.add_spacer(height=10)
+            dpg.add_text("Add new template:", color=(180, 180, 180))
+            with dpg.group(horizontal=True):
+                dpg.add_input_text(tag="new_template_input", width=200, on_enter=True,
+                                   callback=self.func_menu_add_template)
+                dpg.add_button(label="Add", callback=self.func_menu_add_template)
+
+        # ── Context menus ─────────────────────────────────────
+        with dpg.window(tag="ctx_start", show=False, popup=True, no_title_bar=True, width=220):
+            dpg.add_menu_item(label="Delete Start", callback=lambda: self.ctx_start_delete())
+            dpg.add_separator()
+            dpg.add_menu_item(label="Rotate +45°", callback=lambda: self.ctx_start_rotate(45))
+            dpg.add_menu_item(label="Rotate +90°", callback=lambda: self.ctx_start_rotate(90))
+            dpg.add_menu_item(label="Rotate -45°", callback=lambda: self.ctx_start_rotate(-45))
+            dpg.add_separator()
+            for deg in [0, 90, 180, 270, 315]:
+                dpg.add_menu_item(label=f"Set {deg}°", callback=lambda d=deg: self.ctx_start_set_rot(d))
+
+        with dpg.window(tag="ctx_func", show=False, popup=True, no_title_bar=True, width=240):
+            dpg.add_menu_item(label="Delete Function", callback=lambda: self.ctx_func_delete())
+            dpg.add_menu_item(label="Copy Function", callback=lambda: self.copy_selection())
+            dpg.add_menu_item(label="Cut Function", callback=lambda: self.cut_selection())
+            dpg.add_menu_item(label="Toggle Type", tag="ctx_func_toggle_type",
+                              callback=lambda: self.ctx_func_toggle_type())
+            dpg.add_separator()
+            dpg.add_menu_item(label="Rotate +45°", callback=lambda: self.ctx_func_rotate(45))
+            dpg.add_menu_item(label="Rotate +90°", callback=lambda: self.ctx_func_rotate(90))
+            dpg.add_menu_item(label="Rotate -45°", callback=lambda: self.ctx_func_rotate(-45))
+            dpg.add_menu_item(label="Set Rotation 0°",
+                              callback=lambda: (self.push_undo(), setattr(self._ctx_func, 'rotation', 0))
+                              if hasattr(self, '_ctx_func') else None)
+
+        with dpg.window(tag="ctx_general", show=False, popup=True, no_title_bar=True, width=180):
+            dpg.add_menu_item(label="Clear Path",
+                              callback=lambda: (self.push_undo(), self.path_points.clear(),
+                                                setattr(self, 'status_msg', 'Path cleared')))
+            dpg.add_menu_item(label="Paste", callback=lambda: self.paste_clipboard())
+            dpg.add_separator()
+            dpg.add_menu_item(label="Save", callback=lambda: self.save_all())
+            dpg.add_menu_item(label="Load", callback=lambda: self.load_all())
+            dpg.add_menu_item(label="Toggle Snap",
+                              callback=lambda: (setattr(self, 'snap_enabled', not self.snap_enabled),
+                                                setattr(self, 'status_msg', f"Snap: {'ON' if self.snap_enabled else 'OFF'}")))
+
+        # ── Input handlers ────────────────────────────────────
+        with dpg.handler_registry():
+            dpg.add_mouse_down_handler(callback=self.on_mouse_down)
+            dpg.add_mouse_release_handler(callback=self.on_mouse_release)
+            dpg.add_mouse_move_handler(callback=self.on_mouse_move)
+            dpg.add_mouse_wheel_handler(callback=self.on_mouse_wheel)
+            dpg.add_key_press_handler(callback=self.on_key_press)
+            # Environment editor handlers
+            dpg.add_mouse_down_handler(callback=self.env_editor._on_mouse_down)
+            dpg.add_mouse_release_handler(callback=self.env_editor._on_mouse_release)
+            dpg.add_mouse_move_handler(callback=self.env_editor._on_mouse_move)
+            dpg.add_mouse_wheel_handler(callback=self.env_editor._on_mouse_wheel)
+            dpg.add_key_press_handler(callback=self.env_editor._on_key)
+
+        # ── Theme ─────────────────────────────────────────────
+        with dpg.theme() as global_theme:
+            with dpg.theme_component(dpg.mvAll):
+                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (30, 30, 30, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_MenuBarBg, (35, 35, 45, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_TitleBg, (40, 40, 50, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_TitleBgActive, (50, 50, 70, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_Button, (50, 60, 80, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (70, 80, 110, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (90, 100, 130, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (40, 45, 55, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_Header, (50, 55, 70, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, (65, 70, 90, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, (80, 85, 110, 255))
+                dpg.add_theme_color(dpg.mvThemeCol_PopupBg, (40, 40, 50, 240))
+                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 4)
+                dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 6)
+                dpg.add_theme_style(dpg.mvStyleVar_PopupRounding, 4)
+        dpg.bind_theme(global_theme)
+
+        with dpg.theme() as status_theme:
+            with dpg.theme_component(dpg.mvAll):
+                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (20, 20, 20, 180))
+        dpg.bind_item_theme("status_window", status_theme)
+
+        dpg.setup_dearpygui()
+        dpg.show_viewport()
+
+    # ── Run loop ─────────────────────────────────────────────────
+    def update_status(self):
+        dpg.configure_item("status_window", show=self.show_status_bar)
+        if not self.show_status_bar:
+            return
+        snap = "ON" if self.snap_enabled else "OFF"
+        start = (f"({self.start_pos[0]:.0f}, {self.start_pos[1]:.0f}) @ {self.start_pos[2]}°"
+                 if self.start_pos else "NOT SET — Press P")
+        mode = ""
+        if self.placing_start:
+            mode = " | MODE: Placing Start"
+        elif self.placing_function:
+            mode = f" | MODE: Placing {self.selected_action}"
+        dpg.set_value("status_text_1",
+                      f"Zoom: {self.scale}x  |  Snap: {snap} ({self.snap_inches}in)  |  "
+                      f"Undo: {len(self.undo_stack)}  Redo: {len(self.redo_stack)}")
+        dpg.set_value("status_text_2",
+                      f"Points: {len(self.path_points)}  |  Functions: {len(self.functions)}  |  "
+                      f"Start: {start}{mode}")
+        dpg.set_value("status_text_3", self.status_msg)
+        dpg.set_value("status_text_4",
+                      f"File: {os.path.basename(self.current_path_file) if self.current_path_file else '(unsaved)'}"
+                      f"  |  Env: {self.active_env.metadata.name if self.active_env else 'None'}")
+
+    def resize_to_viewport(self):
+        vw = dpg.get_viewport_client_width()
+        vh = dpg.get_viewport_client_height()
+        dpg.configure_item("drawlist_window", width=vw, height=vh)
+        dpg.configure_item("canvas", width=vw, height=vh)
+        dpg.configure_item("status_window", width=vw)
+
     def run(self):
-        running = True
-        while running:
-            self.screen.fill(COLOR_BG)
-            
-            # Draw field elements
-            if self.bg:
-                self.screen.blit(self.bg, (self.fullscreen_padding + self.offset_x, 
-                                          self.fullscreen_padding + self.offset_y))
-            
-            self.draw_grid()
-            self.draw_path()
-            self.draw_start_pos()  # Draw start position
-            self.draw_functions()
-            
-            # Draw UI
-            self.draw_ui()
-            
-            if self.context_menu_pos:
-                self.draw_context_menu()
-            
-            if self.show_help:
-                self.draw_help_menu()
-            
-            if self.show_function_menu:
-                self.draw_function_menu()
-            
-            # Draw path start indicator
-            if self.start_pos and len(self.path_points) == 0 and not self.placing_function and not self.placing_start:
-                # Show that path will start from start position
-                mx, my = pygame.mouse.get_pos()
-                start_x, start_y, _ = self.start_pos
-                sx, sy = self.field_to_screen(start_x, start_y)
-                
-                # Draw dotted line from start to mouse
-                pygame.draw.line(self.screen, (100, 255, 100), (sx, sy), (mx, my), 1)
-                
-                # Draw hint text
-                hint = self.font_small.render("Path will start from START position", True, (100, 255, 100))
-                self.screen.blit(hint, (mx + 10, my - 20))
-            
-            # Draw placement cursor for start position
-            if self.placing_start:
-                mx, my = pygame.mouse.get_pos()
-                fx, fy = self.screen_to_field(mx, my)
-                fx, fy = self.snap_coord(fx, fy)
-                sx, sy = self.field_to_screen(fx, fy)
-                
-                radius = int(18 * self.scale)
-                
-                # Draw preview circle
-                pygame.draw.circle(self.screen, (255, 255, 255, 128), (sx, sy), radius, 2)
-                pygame.draw.circle(self.screen, (0, 255, 0, 128), (sx, sy), radius - 5, 1)
-                
-                # Draw preview arrow pointing right (0°)
-                arrow_length = radius + 10
-                end_x = sx + arrow_length
-                end_y = sy
-                pygame.draw.line(self.screen, (255, 255, 255, 128), (sx, sy), (end_x, end_y), 2)
-                
-                label = self.font_small.render("START (0°)", True, (255, 255, 255))
-                self.screen.blit(label, (sx - label.get_width()//2, sy - radius - 25))
-            
-            # Draw placement cursor
-            elif self.placing_function:
-                mx, my = pygame.mouse.get_pos()
-                fx, fy = self.screen_to_field(mx, my)
-                fx, fy = self.snap_coord(fx, fy)
-                sx, sy = self.field_to_screen(fx, fy)
-                
-                w = int(12 * self.scale)
-                h = int(12 * self.scale)
-                
-                # Choose color based on action/type
-                if self.selected_action == "rotate_only":
-                    color = (255, 255, 0)  # Yellow
-                    pygame.draw.circle(self.screen, color, (sx, sy), w//2, 2)
-                    label = self.font_small.render("Rotate Only", True, color)
-                elif self.selected_function_type == "wait_till":
-                    color = COLOR_FUNCTION  # Green
-                    rect = pygame.Rect(sx - w//2, sy - h//2, w, h)
-                    pygame.draw.rect(self.screen, color, rect, 2)
-                    label = self.font_small.render(f"Wait: {self.selected_function}", True, color)
-                else:  # run_while_moving
-                    color = (0, 150, 255)  # Blue
-                    rect = pygame.Rect(sx - w//2, sy - h//2, w, h)
-                    pygame.draw.rect(self.screen, color, rect, 2)
-                    label = self.font_small.render(f"Move: {self.selected_function}", True, color)
-                
-                self.screen.blit(label, (sx - label.get_width()//2, sy - h//2 - 20))
-            
-            pygame.display.flip()
-            self.clock.tick(60)
-            
-            running = self.handle_events()
-        
-        pygame.quit()
+        self.build()
+        while dpg.is_dearpygui_running():
+            self.resize_to_viewport()
+            self.update_status()
+            self.render()
+            # Environment editor
+            self.active_env = self.env_editor.get_env()
+            self.env_editor.resize()
+            self.env_editor.render()
+            dpg.render_dearpygui_frame()
+        if self.prefs.get("auto_save"):
+            self.save_all()
+        dpg.destroy_context()
+
 
 if __name__ == "__main__":
-    app = PathTracer()
-    app.run()
+    PathTracer().run()
