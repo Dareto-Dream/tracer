@@ -1,0 +1,39 @@
+{
+  "functions": [
+    {
+      "name": "score",
+      "x": 84,
+      "y": 120,
+      "rotation": 315,
+      "type": "wait_till",
+      "action": "function"
+    },
+    {
+      "name": "intake",
+      "x": 104,
+      "y": 108,
+      "rotation": 0,
+      "type": "run_while_moving",
+      "action": "function"
+    },
+    {
+      "name": "intake",
+      "x": 132,
+      "y": 108,
+      "rotation": 0,
+      "type": "run_while_moving",
+      "action": "function"
+    }
+  ],
+  "templates": [
+    "intake",
+    "outtake",
+    "score",
+    "park"
+  ],
+  "start_pos": {
+    "x": 84,
+    "y": 132,
+    "rotation": 315
+  }
+}
